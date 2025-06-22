@@ -1,0 +1,12 @@
+{
+  "timestamp": "2025-06-22T01:24:27Z",
+  "tested_ips": 0,
+  "best_ip": {
+    "ip": "140.82.113.3",
+    "latency": 0,
+    "speed": 500,
+    "packetLoss": 0,
+    "score": 0.5
+  },
+  "all_ips": []
+}

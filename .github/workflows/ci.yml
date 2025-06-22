@@ -1,0 +1,104 @@
+name: Smart GitHub CDN Optimizer
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+  schedule:
+    - cron: '0 */4 * * *'  # 每4小时运行
+
+jobs:
+  optimize-cdn:
+    runs-on: ubuntu-latest
+    name: Find Best CDN Node
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.22'
+
+      - name: Add DNS dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y dnsutils libdns-dev
+
+      - name: Build CDN optimizer
+        run: go build -o cdn-optimizer smartcdn.go
+
+      - name: Run CDN optimizer
+        run: |
+          ./cdn-optimizer
+          echo "BEST_CDN=$(cat results/best_cdn.txt)" >> $GITHUB_ENV
+          echo "BEST_CDN=$(cat results/best_cdn.txt)" >> $GITHUB_OUTPUT
+          
+          # 直接写入环境变量
+          echo "GITHUB_FAST_CDN=$BEST_CDN" >> $GITHUB_ENV
+
+      - name: Upload CDN report
+        uses: actions/upload-artifact@v3
+        with:
+          name: cdn-report
+          path: results/
+
+  use-optimized-cdn:
+    needs: optimize-cdn
+    runs-on: ubuntu-latest
+    name: Use Optimized CDN
+    env:
+      GH_CDN_IP: ${{ needs.optimize-cdn.outputs.BEST_CDN }}
+      CI_OPTIMIZED: true
+
+    steps:
+      - name: Configure global Git settings
+        run: |
+          # 为所有Git操作设置CDN代理
+          git config --global url.https://$GH_CDN_IP/.insteadOf https://github.com/
+          git config --global http.https://github.com/.proxy ""
+          
+          echo "所有Git操作将通过CDN节点: $GH_CDN_IP"
+
+      - name: Configure npm for GitHub Packages
+        if: startsWith(github.repository_owner, 'npm')
+        run: |
+          npm config set registry https://npm.pkg.github.com
+          npm config set @${{ github.repository_owner }}:registry=https://npm.pkg.github.com
+
+      - name: Install dependencies
+        run: npm ci || npm install
+
+      - name: Checkout with CDN
+        uses: actions/checkout@v4
+        with:
+          # 禁用深度克隆
+          fetch-depth: 0
+          # 优化Git配置
+          sparse-checkout: |
+            /*
+            !node_modules
+
+      - name: Run tests with CDN optimization
+        run: npm test
+
+      - name: Report performance
+        run: |
+          start_time=$(date +%s)
+          git rev-parse --all # 测试Git操作速度
+          duration=$(( $(date +%s) - start_time ))
+          
+          echo "Git操作时间: ${duration}秒"
+          echo "Git操作时间: ${duration}秒" >> $GITHUB_STEP_SUMMARY
+          
+          # 测量下载速度
+          start_dl=$(date +%s.%N)
+          curl -sO https://github.com/${{ github.repository }}/archive/main.zip
+          dl_time=$(echo "$(date +%s.%N) - $start_dl" | bc)
+          dl_speed=$(echo "scale=2; $(stat -c%s main.zip) / 1024 / $dl_time" | bc)
+          
+          echo "下载速度: ${dl_speed} KB/s"
+          echo "下载速度: ${dl_speed} KB/s" >> $GITHUB_STEP_SUMMARY
+
+      # 添加您的构建/部署步骤
