@@ -40,7 +40,7 @@ jobs:
           echo "GITHUB_FAST_CDN=$BEST_CDN" >> $GITHUB_ENV
 
       - name: Upload CDN report
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: cdn-report
           path: results/
