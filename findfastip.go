@@ -2,153 +2,59 @@ package main
 
 import (
 	"bufio"
-	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
-	"net"
-	"net/http"
+	"log"
 	"os"
 	"os/exec"
 	"runtime"
 	"strings"
 	"time"
+
+	"github.com/chromedp/chromedp"
 )
-
-const (
-	itdogURL = "https://www.itdog.cn/tc/ping/"
-	timeout  = 20 * time.Second
-)
-
-var domains = []string{
-	"github.com",
-	"raw.githubusercontent.com",
-	"github.global.ssl.fastly.net",
-	"assets-cdn.github.com",
-}
-
-type PingResult struct {
-	Data struct {
-		NodeList []struct {
-			NodeName string  `json:"node_name"`
-			IP       string  `json:"ip"`
-			Timeout  int     `json:"timeout"`
-			Time     []int   `json:"time"`
-			AvgTime  float64 `json:"avg_time"`
-		} `json:"node_list"`
-	} `json:"data"`
-}
 
 func main() {
-	// 获取最优IP映射
-	ipMap := make(map[string]string)
-	for _, domain := range domains {
-		if ip, err := getBestIP(domain); err == nil {
-			fmt.Printf("✅ 域名: %-30s 最优IP: %s\n", domain, ip)
-			ipMap[domain] = ip
-		} else {
-			fmt.Printf("❌ 域名: %s 错误: %v\n", domain, err)
-		}
-	}
+	opts := append(chromedp.DefaultExecAllocatorOptions[:],
+		chromedp.Flag("headless", true),
+		chromedp.UserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"),
+	)
 
-	// 更新hosts文件
-	if len(ipMap) > 0 {
-		if err := updateHosts(ipMap); err != nil {
-			fmt.Println("❌ 更新hosts文件失败:", err)
-		}
-	}
-
-	// 刷新DNS缓存
-	flushDNS()
-	fmt.Println("\n操作完成，GitHub访问已加速！🚀")
-}
-
-// 获取最优IP
-func getBestIP(domain string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	ctx, cancel := chromedp.NewExecAllocator(context.Background(), opts...)
 	defer cancel()
 
-	// 构建请求
-	payload := fmt.Sprintf("host=%s&number=2", domain)
-	req, err := http.NewRequestWithContext(ctx, "POST", itdogURL, bytes.NewBufferString(payload))
+	ctx, cancel = chromedp.NewContext(ctx)
+	defer cancel()
+	ctx, cancel = context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+
+	var ips string
+	err := chromedp.Run(ctx,
+		chromedp.Navigate("https://www.itdog.cn/ping/github.com"),
+		chromedp.Click(`//button[contains(text(),'单次测试')]`, chromedp.NodeVisible),
+		chromedp.WaitVisible(`a.copy_ip`),
+		chromedp.AttributeValue(`a.copy_ip`, "copy-text", &ips, nil),
+	)
+
 	if err != nil {
-		return "", err
+		log.Fatal(err)
 	}
 
-	// 模拟浏览器请求
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36")
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("Referer", "https://www.itdog.cn/tc/ping/")
+	// 提取IP并保存到host
+	ipList := strings.Split(ips, "\n")
+	var host []string
 
-	// 发送请求
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	// 读取响应
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
-	}
-
-	// 解析JSON
-	var result PingResult
-	if err := json.Unmarshal(body, &result); err != nil {
-		return "", fmt.Errorf("JSON解析错误: %v", err)
-	}
-
-	// 分析测试结果
-	return findFastestIP(result, domain)
-}
-
-// 查找最快IP
-func findFastestIP(result PingResult, domain string) (string, error) {
-	var bestIP string
-	minAvg := 1000.0 // 设置较大的初始值
-
-	ips := make(map[string][]float64) // IP到延迟列表的映射
-
-	// 收集所有IP的延迟数据
-	for _, node := range result.Data.NodeList {
-		// 过滤超时结果
-		if node.Timeout > 0 {
-			continue
-		}
-
-		// 仅处理包含中文城市名称的节点（国内节点）
-		if strings.ContainsAny(node.NodeName, "北京上海广州深圳成都") {
-			ips[node.IP] = append(ips[node.IP], node.AvgTime)
+	fmt.Println("提取到的IP地址：")
+	for i, ip := range ipList {
+		ip = strings.TrimSpace(ip)
+		if ip != "" {
+			fmt.Printf("%2d: %s\n", i+1, ip)
+			host = append(host, ip)
 		}
 	}
 
-	// 计算平均延迟并找出最优IP
-	for ip, delays := range ips {
-		var sum float64
-		for _, d := range delays {
-			sum += d
-		}
-		avg := sum / float64(len(delays))
-
-		if avg < minAvg {
-			minAvg = avg
-			bestIP = ip
-		}
-	}
-
-	if bestIP == "" {
-		return "", fmt.Errorf("未找到低延迟的国内IP")
-	}
-
-	// 验证IP是否有效
-	if parsedIP := net.ParseIP(bestIP); parsedIP == nil {
-		return "", fmt.Errorf("无效IP地址: %s", bestIP)
-	}
-
-	return bestIP, nil
+	fmt.Println("\n所有IP已保存到host变量")
+	fmt.Printf("共提取到 %d 个有效IP\n", len(host))
 }
 
 // 更新hosts文件
