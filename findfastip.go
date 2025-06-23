@@ -1,292 +1,271 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
+	"runtime"
 	"strings"
-	"sync"
 	"time"
-
-	"github.com/miekg/dns"
 )
 
 const (
-	dohServer   = "https://cloudflare-dns.com/dns-query" // DoH服务器
-	testFileURL = "https://github.com/favicon.ico"       // 测试文件
+	itdogURL = "https://www.itdog.cn/tc/ping/"
+	timeout  = 20 * time.Second
 )
 
-type RegionInfo struct {
-	Region     string `json:"region"`
-	Country    string `json:"country"`
-	City       string `json:"city,omitempty"`
-	GitHubEdge string `json:"github_edge,omitempty"`
-	ResolverIP string `json:"resolver_ip,omitempty"`
+var domains = []string{
+	"github.com",
+	"raw.githubusercontent.com",
+	"github.global.ssl.fastly.net",
+	"assets-cdn.github.com",
+}
+
+type PingResult struct {
+	Data struct {
+		NodeList []struct {
+			NodeName string  `json:"node_name"`
+			IP       string  `json:"ip"`
+			Timeout  int     `json:"timeout"`
+			Time     []int   `json:"time"`
+			AvgTime  float64 `json:"avg_time"`
+		} `json:"node_list"`
+	} `json:"data"`
 }
 
 func main() {
-	log.Println("Starting Smart GitHub CDN Optimizer")
+	// 获取最优IP映射
+	ipMap := make(map[string]string)
+	for _, domain := range domains {
+		if ip, err := getBestIP(domain); err == nil {
+			fmt.Printf("✅ 域名: %-30s 最优IP: %s\n", domain, ip)
+			ipMap[domain] = ip
+		} else {
+			fmt.Printf("❌ 域名: %s 错误: %v\n", domain, err)
+		}
+	}
 
-	// 第一步：确定Action所在区域
-	regionInfo, err := detectActionRegion()
+	// 更新hosts文件
+	if len(ipMap) > 0 {
+		if err := updateHosts(ipMap); err != nil {
+			fmt.Println("❌ 更新hosts文件失败:", err)
+		}
+	}
+
+	// 刷新DNS缓存
+	flushDNS()
+	fmt.Println("\n操作完成，GitHub访问已加速！🚀")
+}
+
+// 获取最优IP
+func getBestIP(domain string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	// 构建请求
+	payload := fmt.Sprintf("host=%s&number=2", domain)
+	req, err := http.NewRequestWithContext(ctx, "POST", itdogURL, bytes.NewBufferString(payload))
 	if err != nil {
-		log.Fatalf("区域检测失败: %v", err)
+		return "", err
 	}
 
-	// 第二步：获取该区域的GitHub CDN节点
-	nodes, err := getGitHubCDNNodes(regionInfo)
+	// 模拟浏览器请求
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36")
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Referer", "https://www.itdog.cn/tc/ping/")
+
+	// 发送请求
+	client := &http.Client{}
+	resp, err := client.Do(req)
 	if err != nil {
-		log.Fatalf("获取CDN节点失败: %v", err)
-	}
-
-	// 第三步：测试并选择最优节点
-	bestNode := findBestCDNNode(nodes)
-
-	// 第四步：验证并保存结果
-	if validateCDNNode(bestNode) {
-		saveResults(regionInfo, bestNode)
-		log.Printf("找到最优CDN节点: %s (延迟: %.2fms, 速度: %.2fKB/s)",
-			bestNode.IP, bestNode.Latency, bestNode.Speed)
-	} else {
-		log.Println("没有找到有效CDN节点，使用默认配置")
-		saveFallbackResult()
-	}
-}
-
-// 检测Action运行区域
-func detectActionRegion() (RegionInfo, error) {
-	info := RegionInfo{}
-
-	// 从GitHub API获取区域信息
-	resp, err := http.Get("https://api.github.com/meta")
-	if err == nil {
-		defer resp.Body.Close()
-		var meta struct {
-			Runners map[string][]string `json:"actions"`
-		}
-		if err := json.NewDecoder(resp.Body).Decode(&meta); err == nil {
-			// 从实例元数据中获取区域信息
-			ec2Resp, err := http.Get("http://169.254.169.254/latest/meta-data/placement/availability-zone")
-			if err == nil {
-				defer ec2Resp.Body.Close()
-				if az, err := io.ReadAll(ec2Resp.Body); err == nil {
-					azStr := string(az)
-					info.Region = azStr[:len(azStr)-1] // 移除可用区后缀
-				}
-			}
-		}
-	}
-
-	// 使用IP定位服务
-	if info.Region == "" {
-		ipInfoResp, err := http.Get("https://ipinfo.io/json")
-		if err == nil {
-			defer ipInfoResp.Body.Close()
-			var ipInfo struct {
-				Country string `json:"country"`
-				Region  string `json:"region"`
-				City    string `json:"city"`
-				Org     string `json:"org"`
-			}
-			if err := json.NewDecoder(ipInfoResp.Body).Decode(&ipInfo); err == nil {
-				info.Country = ipInfo.Country
-				info.Region = ipInfo.Region
-				info.City = ipInfo.City
-
-				// 检测是否在GitHub自有基础设施上运行
-				if strings.Contains(ipInfo.Org, "GitHub") {
-					info.GitHubEdge = "self-hosted"
-				}
-			}
-		}
-	}
-
-	// 获取本地DNS解析器
-	if resolvConf, err := os.Open("/etc/resolv.conf"); err == nil {
-		defer resolvConf.Close()
-		if content, err := io.ReadAll(resolvConf); err == nil {
-			for _, line := range strings.Split(string(content), "\n") {
-				if strings.HasPrefix(line, "nameserver") {
-					parts := strings.Fields(line)
-					if len(parts) > 1 {
-						info.ResolverIP = parts[1]
-						break
-					}
-				}
-			}
-		}
-	}
-
-	return info, nil
-}
-
-// 使用DNS-over-HTTPS获取GitHub CDN节点
-func getGitHubCDNNodes(region RegionInfo) ([]CDNNode, error) {
-	var nodes []CDNNode
-
-	// 使用DNS-over-HTTPS查询
-	client := new(dns.Client)
-	msg := new(dns.Msg)
-	msg.SetQuestion("github.com.", dns.TypeA)
-	msg.SetEdns0(4096, true) // 启用EDNS0
-
-	// 如果知道区域信息，添加ECS扩展
-	if region.ResolverIP != "" {
-		ecs := new(dns.EDNS0_SUBNET)
-		ecs.Code = dns.EDNS0SUBNET
-		ecs.Family = 1 // IPv4
-		ecs.SourceNetmask = 24
-		if ip := net.ParseIP(region.ResolverIP); ip != nil {
-			ecs.Address = ip
-			opt := new(dns.OPT)
-			opt.Hdr.Name = "."
-			opt.Hdr.Rrtype = dns.TypeOPT
-			opt.Option = append(opt.Option, ecs)
-			msg.Extra = append(msg.Extra, opt)
-		}
-	}
-
-	// 执行DNS查询
-	resp, _, err := client.Exchange(msg, dohServer)
-	if err != nil {
-		return nil, err
-	}
-
-	// 解析结果
-	for _, ans := range resp.Answer {
-		if a, ok := ans.(*dns.A); ok {
-			nodes = append(nodes, CDNNode{
-				IP:     a.A.String(),
-				Region: region.Region,
-			})
-		}
-	}
-
-	// 特殊处理已知区域的CDN边缘
-	switch region.Region {
-	case "ap-southeast-1": // 新加坡
-		nodes = append(nodes, CDNNode{IP: "13.229.188.59"}) // GitHub SG CDN
-	case "ap-northeast-1": // 东京
-		nodes = append(nodes, CDNNode{IP: "13.114.40.48"}) // GitHub JP CDN
-	case "eu-central-1": // 法兰克福
-		nodes = append(nodes, CDNNode{IP: "18.184.176.26"}) // GitHub DE CDN
-	}
-
-	return nodes, nil
-}
-
-type CDNNode struct {
-	IP      string
-	Region  string
-	Latency float64
-	Speed   float64
-}
-
-// 测试并选择最优CDN节点
-func findBestCDNNode(nodes []CDNNode) CDNNode {
-	if len(nodes) == 0 {
-		return CDNNode{IP: "140.82.113.3"} // 默认回退
-	}
-
-	// 并发测试所有节点
-	var wg sync.WaitGroup
-	results := make(chan CDNNode, len(nodes))
-
-	for _, node := range nodes {
-		wg.Add(1)
-		go func(n CDNNode) {
-			defer wg.Done()
-			n.Latency = testLatency(n.IP)
-			if n.Latency > 0 {
-				n.Speed = testDownloadSpeed(n.IP)
-			}
-			results <- n
-		}(node)
-	}
-
-	go func() {
-		wg.Wait()
-		close(results)
-	}()
-
-	bestNode := CDNNode{Latency: 1000}
-	for node := range results {
-		if node.Latency > 0 && node.Latency < bestNode.Latency {
-			bestNode = node
-		}
-	}
-
-	return bestNode
-}
-
-func testLatency(ip string) float64 {
-	start := time.Now()
-	conn, err := net.DialTimeout("tcp", ip+":443", 2*time.Second)
-	if err != nil {
-		return -1
-	}
-	defer conn.Close()
-	return time.Since(start).Seconds() * 1000 // ms
-}
-
-func testDownloadSpeed(ip string) float64 {
-	client := http.Client{
-		Transport: &http.Transport{
-			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-				return net.Dial("tcp", ip+":443")
-			},
-		},
-		Timeout: 5 * time.Second,
-	}
-
-	start := time.Now()
-	resp, err := client.Get(testFileURL)
-	if err != nil {
-		return 0
+		return "", err
 	}
 	defer resp.Body.Close()
 
-	_, err = io.Copy(io.Discard, resp.Body)
+	// 读取响应
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return 0
+		return "", err
 	}
 
-	duration := time.Since(start).Seconds()
-	sizeKB := float64(4500) / 1024
-	return sizeKB / duration
-}
-
-func validateCDNNode(node CDNNode) bool {
-	return node.Latency > 0 && node.Latency < 500 && node.Speed > 100
-}
-
-func saveResults(region RegionInfo, node CDNNode) {
-	// 创建结果目录
-	os.Mkdir("results", 0755)
-
-	// 保存最优节点
-	os.WriteFile("results/best_cdn.txt", []byte(node.IP), 0644)
-
-	// 保存完整报告
-	report := struct {
-		Timestamp string     `json:"timestamp"`
-		Region    RegionInfo `json:"region"`
-		BestCDN   CDNNode    `json:"best_cdn"`
-	}{
-		Timestamp: time.Now().UTC().Format(time.RFC3339),
-		Region:    region,
-		BestCDN:   node,
+	// 解析JSON
+	var result PingResult
+	if err := json.Unmarshal(body, &result); err != nil {
+		return "", fmt.Errorf("JSON解析错误: %v", err)
 	}
 
-	if data, err := json.MarshalIndent(report, "", "  "); err == nil {
-		os.WriteFile("results/cdn_report.json", data, 0644)
-	}
+	// 分析测试结果
+	return findFastestIP(result, domain)
 }
 
-func saveFallbackResult() {
-	os.WriteFile("results/best_cdn.txt", []byte("geo-optimized"), 0644)
+// 查找最快IP
+func findFastestIP(result PingResult, domain string) (string, error) {
+	var bestIP string
+	minAvg := 1000.0 // 设置较大的初始值
+
+	ips := make(map[string][]float64) // IP到延迟列表的映射
+
+	// 收集所有IP的延迟数据
+	for _, node := range result.Data.NodeList {
+		// 过滤超时结果
+		if node.Timeout > 0 {
+			continue
+		}
+
+		// 仅处理包含中文城市名称的节点（国内节点）
+		if strings.ContainsAny(node.NodeName, "北京上海广州深圳成都") {
+			ips[node.IP] = append(ips[node.IP], node.AvgTime)
+		}
+	}
+
+	// 计算平均延迟并找出最优IP
+	for ip, delays := range ips {
+		var sum float64
+		for _, d := range delays {
+			sum += d
+		}
+		avg := sum / float64(len(delays))
+
+		if avg < minAvg {
+			minAvg = avg
+			bestIP = ip
+		}
+	}
+
+	if bestIP == "" {
+		return "", fmt.Errorf("未找到低延迟的国内IP")
+	}
+
+	// 验证IP是否有效
+	if parsedIP := net.ParseIP(bestIP); parsedIP == nil {
+		return "", fmt.Errorf("无效IP地址: %s", bestIP)
+	}
+
+	return bestIP, nil
+}
+
+// 更新hosts文件
+func updateHosts(ipMap map[string]string) error {
+	// 根据操作系统确定hosts文件路径
+	var hostsPath string
+	switch runtime.GOOS {
+	case "windows":
+		hostsPath = `C:\Windows\System32\drivers\etc\hosts`
+	case "linux", "darwin": // darwin是macOS
+		hostsPath = "/etc/hosts"
+	default:
+		return fmt.Errorf("不支持的操作系统: %s", runtime.GOOS)
+	}
+
+	// 读取现有hosts文件
+	file, err := os.Open(hostsPath)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	var newLines []string
+	scanner := bufio.NewScanner(file)
+	existingDomains := make(map[string]bool)
+
+	// 处理每一行
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		// 保留注释行
+		if strings.HasPrefix(line, "#") {
+			newLines = append(newLines, line)
+			continue
+		}
+
+		// 解析主机行
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			newLines = append(newLines, line)
+			continue
+		}
+
+		// 检查是否是需要更新的域名
+		updated := false
+		for i := 1; i < len(fields); i++ {
+			domain := fields[i]
+			if newIP, exists := ipMap[domain]; exists {
+				if fields[0] != newIP {
+					// 构建更新行
+					newLine := newIP + " " + strings.Join(fields[1:], " ")
+					newLines = append(newLines, newLine)
+					fmt.Printf("🔄 更新: %s -> %s\n", domain, newIP)
+				} else {
+					fmt.Printf("✅ 无需更新: %s 已是最新\n", domain)
+					newLines = append(newLines, line)
+				}
+				updated = true
+				existingDomains[domain] = true
+				break
+			}
+		}
+
+		if !updated {
+			newLines = append(newLines, line)
+		}
+	}
+
+	// 添加缺失的域名条目
+	for domain, ip := range ipMap {
+		if !existingDomains[domain] {
+			newLine := fmt.Sprintf("%s %s", ip, domain)
+			newLines = append(newLines, newLine)
+			fmt.Printf("➕ 新增: %s -> %s\n", domain, ip)
+		}
+	}
+
+	// 写入更新后的hosts文件
+	output, err := os.Create(hostsPath)
+	if err != nil {
+		return err
+	}
+	defer output.Close()
+
+	writer := bufio.NewWriter(output)
+	for _, line := range newLines {
+		fmt.Fprintln(writer, line)
+	}
+	writer.Flush()
+
+	return nil
+}
+
+// 刷新DNS缓存
+func flushDNS() {
+	fmt.Println("\n刷新DNS缓存...")
+	var cmd *exec.Cmd
+
+	switch runtime.GOOS {
+	case "windows":
+		cmd = exec.Command("ipconfig", "/flushdns")
+	case "darwin": // macOS
+		cmd = exec.Command("sudo", "killall", "-HUP", "mDNSResponder")
+	case "linux":
+		// 尝试不同的Linux刷新方法
+		if _, err := exec.LookPath("resolvectl"); err == nil {
+			cmd = exec.Command("sudo", "resolvectl", "flush-caches")
+		} else {
+			cmd = exec.Command("sudo", "systemd-resolve", "--flush-caches")
+		}
+	default:
+		fmt.Println("⚠️ 不支持的操作系统，请手动刷新DNS")
+		return
+	}
+
+	if err := cmd.Run(); err != nil {
+		fmt.Printf("⚠️ 刷新DNS失败: %v (可能需要sudo权限)\n", err)
+	} else {
+		fmt.Println("✅ DNS缓存刷新完成")
+	}
 }
