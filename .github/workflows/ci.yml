@@ -24,7 +24,7 @@ jobs:
 
       - name: Add DNS dependencies
         run: |
-go install github.com/libdns/libdns@latest
+                go install github.com/libdns/libdns@latest
 
       - name: Build CDN optimizer
         run: go build -o cdn-optimizer smartcdn.go
