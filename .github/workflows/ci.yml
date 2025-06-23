@@ -27,7 +27,7 @@ jobs:
                # go install github.com/libdns/libdns@latest
 
       - name: Build CDN optimizer
-        run: go build -o cdn-optimizer smartcdn.go
+        run: go build -o cdn-optimizer . # smartcdn.go
 
       - name: Run CDN optimizer
         run: |
